@@ -8,7 +8,8 @@ mod tls;
 use std::io::{BufRead, BufReader, Cursor, Read, Write, copy};
 #[cfg(not(feature = "secure"))]
 use std::marker::PhantomData;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
+use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -45,6 +46,7 @@ where
     nat_workaround: bool,
     welcome_msg: Option<String>,
     active_timeout: Duration,
+    active_ports: Option<RangeInclusive<u16>>,
     passive_stream_builder: Box<PassiveStreamBuilder>,
     #[cfg(not(feature = "secure"))]
     marker: PhantomData<T>,
@@ -83,6 +85,7 @@ where
             nat_workaround: false,
             welcome_msg: None,
             active_timeout: Duration::from_secs(60),
+            active_ports: None,
             passive_stream_builder: Self::default_passive_stream_builder(),
             #[cfg(feature = "secure")]
             tls_ctx: None,
@@ -126,6 +129,12 @@ where
     pub fn set_mode(&mut self, mode: Mode) {
         debug!("Changed mode to {:?}", mode);
         self.mode = mode;
+    }
+
+    pub fn set_active_ports(&mut self, ports: impl Into<Option<RangeInclusive<u16>>>) {
+        let ports = ports.into();
+        debug!("set active ports: {:?}", ports);
+        self.active_ports = ports;
     }
 
     /// Set NAT workaround for passive mode
@@ -174,6 +183,7 @@ where
             domain: Some(String::from(domain)),
             welcome_msg: self.welcome_msg,
             active_timeout: self.active_timeout,
+            active_ports: self.active_ports,
         };
         // Set protection buffer size
         secured_ftp_tream.perform(Command::Pbsz(0))?;
@@ -222,6 +232,7 @@ where
                     tls_ctx: None,
                     domain: None,
                     active_timeout: Duration::from_secs(60),
+                    active_ports: None,
                 }
             })?;
         debug!("Established connection with server");
@@ -239,6 +250,7 @@ where
             domain: Some(String::from(domain)),
             welcome_msg: None,
             active_timeout: Duration::from_secs(60),
+            active_ports: None,
         };
         debug!("Reading server response...");
         match stream.read_response(Status::Ready) {
@@ -587,7 +599,7 @@ where
     /// use suppaftp::list::File;
     ///
     /// let file: File = File::from_str("-rw-rw-r-- 1 0  1  8192 Nov 5 2018 omar.txt")
-    ///     
+    ///
     ///     .unwrap();
     /// ```
     pub fn list(&mut self, pathname: Option<&str>) -> FtpResult<Vec<String>> {
@@ -958,7 +970,21 @@ where
     /// Create a new tcp listener and send a PORT command for it
     fn active(&mut self) -> FtpResult<TcpListener> {
         debug!("Starting local tcp listener...");
-        let conn = TcpListener::bind("0.0.0.0:0").map_err(FtpError::ConnectionError)?;
+        let conn = if let Some(ports) = self.active_ports.clone() {
+            let mut r = Err(FtpError::ConnectionError(std::io::Error::other(
+                "can not bind socket address",
+            )));
+            for port in ports {
+                if let Ok(l) = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), port))
+                {
+                    r = Ok(l);
+                    break;
+                }
+            }
+            r?
+        } else {
+            TcpListener::bind("0.0.0.0:0").map_err(FtpError::ConnectionError)?
+        };
         conn.set_nonblocking(true)
             .map_err(FtpError::ConnectionError)?;
 
